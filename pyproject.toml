@@ -1,0 +1,15 @@
+[project]
+name = "code-brushes-gui"
+version = "0.1.0"
+description = "A GUI for code brushes"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyside6>=6.10.1",
+]
+
+[dependency-groups]
+dev = [
+    "pylsp-mypy>=0.7.0",
+    "python-lsp-server[all]>=1.14.0",
+]
