@@ -1,9 +1,15 @@
 """Shaper GUI entrypoint."""
 
 from typing import Tuple
+from math import floor
 import sys
-from PySide6.QtGui import QFontDatabase, QFontMetricsF
-from PySide6.QtCore import QRect
+from PySide6.QtGui import (
+    QFontDatabase, QFontMetricsF, QResizeEvent,
+    QMouseEvent
+)
+from PySide6.QtCore import (
+    Qt, QRect, QPoint, QPointF
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QPlainTextEdit, QWidget
 )
@@ -25,18 +31,28 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         """Initialize the widget with an optional parent."""
         super().__init__(parent)
 
+        # Set mouse tracking so that we recieve mouse events even when
+        # a mouse button is not pressed.
+        self.setMouseTracking(True)
+
+        self.viewport().setCursor(Qt.CursorShape.BlankCursor)
+
         self._cursor_overlay_widget = QWidget(self)
         self._cursor_overlay_widget.setGeometry(QRect(0, 0, 100, 100))
         self._cursor_overlay_widget.setStyleSheet(
             "QWidget { border: 1px solid black; }"
         )
+        # Ensure that the cursor overlay widget cannot steal mouse
+        # events from the editor.
+        self._cursor_overlay_widget.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         self.verticalScrollBar().valueChanged.connect(
             lambda: self._update_cursor_overlay_geometry())
         self.horizontalScrollBar().valueChanged.connect(
             lambda: self._update_cursor_overlay_geometry())
 
-    def resizeEvent(self, e, /):
+    def resizeEvent(self, e: QResizeEvent, /) -> None:
         """Handle resize events.
 
         Forward the event to the QPlainTextEdit, and also recompute
@@ -68,7 +84,17 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
             round(char_height)
         )
 
-    def _update_cursor_overlay_geometry(self):
+    def editor_position_under_point(self, point: QPointF) -> Tuple[int, int]:
+        """Find the row and column of a point.
+
+        Given a point in the editor's local coordinate space, return a
+        tuple of (row, col) describing the location of the character
+        under the point.
+        """
+        char_width, char_height = self._find_character_dimensions()
+        return (floor(point.y() / char_height), floor(point.x() / char_width))
+
+    def _update_cursor_overlay_geometry(self) -> None:
         if self._cursor_overlay_position is None:
             return
 
@@ -80,20 +106,32 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         self._cursor_overlay_position = (row, col)
         self._update_cursor_overlay_geometry()
 
+    def mouseMoveEvent(self, e: QMouseEvent) -> None:
+        """Handle mouse move events.
+
+        Forward the event to the QPlainTextEdit, and also update the
+        overlay position so that it rests under the mouse cursor.
+        """
+        super().mouseMoveEvent(e)
+
+        pos = e.position()
+        row, col = self.editor_position_under_point(pos)
+        self.set_overlay_position(row, col)
+
 
 class MainWindow(QMainWindow):
     """The main window of the application."""
 
     _editor: PlainTextEditWithOverlay
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the main window."""
         super().__init__()
         self._configure_editor()
         self._editor.set_overlay_position(1, 10)
         self.setCentralWidget(self._editor)
 
-    def _configure_editor(self):
+    def _configure_editor(self) -> None:
         self._editor = PlainTextEditWithOverlay()
         font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         self._editor.setFont(font)

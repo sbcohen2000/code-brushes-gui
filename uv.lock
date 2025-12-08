@@ -72,6 +72,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "mypy" },
     { name = "pylsp-mypy" },
     { name = "python-lsp-server", extra = ["all"] },
 ]
@@ -81,6 +82,7 @@ requires-dist = [{ name = "pyside6", specifier = ">=6.10.1" }]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "mypy", specifier = ">=1.19.0" },
     { name = "pylsp-mypy", specifier = ">=0.7.0" },
     { name = "python-lsp-server", extras = ["all"], specifier = ">=1.14.0" },
 ]
