@@ -10,7 +10,7 @@ import sys
 import threading
 from PySide6.QtGui import (
    QFontDatabase, QResizeEvent,
-   QMouseEvent, QTextLayout, QPixmap, QIcon
+   QMouseEvent, QTextLayout, QIcon
 )
 from PySide6.QtCore import (
     QObject, QCoreApplication,
@@ -71,14 +71,18 @@ class Request(metaclass=ABCMeta):
     def from_named_tuple(
             cls: type[T],
             methodname: str,
-            field_names: list[type[Any]]
+            field_names: dict[str, type[Any]]
     ) -> type[Any]:
         """Construct a new Request from a named tuple."""
 
         def __init__(self: Any, **kwargs: dict[str, Any]) -> None:
             self.keys = kwargs.keys()
-            for key, value in kwargs.items():
-                self.key = value
+
+            for key, typ in field_names.items():
+                if key not in kwargs:
+                    raise ValueError(f"Key {key} is missing from constructor.")
+
+                self.__dict__[key] = kwargs[key]
 
         def method_params(self: Any) -> JSON | None:
             if len(self.keys) == 0:
@@ -159,8 +163,9 @@ class RequestResponseEvent(QEvent):
         self.res = res
 
 
-PingRequest = Request.from_named_tuple("ping", [])
-ShutdownRequest = Request.from_named_tuple("shutdown", [])
+PingRequest = Request.from_named_tuple("ping", {})
+ShutdownRequest = Request.from_named_tuple("shutdown", {})
+FormatRequest = Request.from_named_tuple("format", {"src": str})
 
 
 class ServerMessageQueue():
@@ -399,22 +404,23 @@ class HeartbeatWidget(QLabel):
 
     def event(self, e: QEvent) -> bool:
         """Handle custom events."""
-        if isinstance(e, RequestResponseEvent):
-            if isinstance(e.req, PingRequest):
-                # We got a pong response. Set the icon to beating and
-                # reset `self._missed_beats`.
-                self._missed_beats = 0
-                self._got_last_beat = True
+        if isinstance(e, RequestResponseEvent) \
+           and isinstance(e.req, PingRequest):
+            # We got a pong response. Set the icon to beating and
+            # reset `self._missed_beats`.
+            self._missed_beats = 0
+            self._got_last_beat = True
 
-                self.setPixmap(self._icon_beating.pixmap(16, 16))
+            self.setPixmap(self._icon_beating.pixmap(16, 16))
 
-                # Switch the icon back to normal after a short
-                # duration.
-                anim_timer = QTimer(self, interval=200, singleShot=True)
-                anim_timer.timeout.connect(
-                    lambda: self.setPixmap(self._icon_normal.pixmap(16, 16))
-                )
-                anim_timer.start()
+            # Switch the icon back to normal after a short
+            # duration.
+            anim_timer = QTimer(self, interval=200, singleShot=True)
+            anim_timer.timeout.connect(
+                lambda: self.setPixmap(self._icon_normal.pixmap(16, 16))
+            )
+            anim_timer.start()
+            return True
 
         # Forward all other events to our superclass.
         return super().event(e)
@@ -425,6 +431,10 @@ class MainWindow(QMainWindow):
 
     _editor: PlainTextEditWithOverlay
     _q: ServerMessageQueue
+
+    # A timer which, when it runs out, indicates that the user has not
+    # made a change to the document in a while.
+    _change_timer: QTimer
 
     def __init__(self, q: ServerMessageQueue) -> None:
         """Initialize the main window."""
@@ -441,12 +451,61 @@ class MainWindow(QMainWindow):
         heartbeat = HeartbeatWidget(q)
         status_bar.addPermanentWidget(heartbeat)
 
+        # Configure the change timer.
+        self._change_timer = QTimer(self, interval=1000, singleShot=True)
+        self._change_timer.timeout.connect(self._request_formatting_actions)
+
+    def _reset_change_timer(self) -> None:
+        self._change_timer.start()
+
     def _configure_editor(self) -> None:
         self._editor = PlainTextEditWithOverlay()
         font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        font.setPointSize(16)
         self._editor.setFont(font)
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self._editor.document().setDocumentMargin(0)
+
+        # Reset the change timer when the document content changes
+        self._editor.document().contentsChanged \
+            .connect(self._reset_change_timer)
+
+        # Reset the change timer when the cursor position changes
+        self._editor.cursorPositionChanged \
+            .connect(self._reset_change_timer)
+
+    def _get_editor_contents(self) -> str:
+        """Get the current contents of the editor as a string."""
+        return self._editor.document().toPlainText()
+
+    def _request_formatting_actions(self) -> None:
+        """Request that the document be re-formatted."""
+        src = self._get_editor_contents()
+        self._q.send(self, FormatRequest(src=src))
+
+    def event(self, e: QEvent) -> bool:
+        """Handle custom events."""
+        if isinstance(e, RequestResponseEvent) \
+           and isinstance(e.req, FormatRequest):
+            result = e.res.result()
+
+            if result is None:
+                # TODO: handle the error properly
+                print(f"Error: {e.res.error()}")
+                return True
+
+            old_src = self._get_editor_contents()
+            new_src = result["src"]
+
+            # Check if the source has changed before dispatching a
+            # call to set the document content. If we don't do this,
+            # we can enter into an infinite loop where the below
+            # change triggers another `contentsChanged` signal.
+            if new_src != old_src:
+                self._editor.setPlainText(new_src)
+
+        # Forward all other events to our superclass.
+        return super().event(e)
 
 
 def main() -> None:
