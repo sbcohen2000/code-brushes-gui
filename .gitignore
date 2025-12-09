@@ -9,5 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# IDE
+# Editor/Tool
 .idea
+*.afdesign

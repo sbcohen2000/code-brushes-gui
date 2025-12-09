@@ -10,14 +10,15 @@ import sys
 import threading
 from PySide6.QtGui import (
    QFontDatabase, QResizeEvent,
-   QMouseEvent, QTextLayout
+   QMouseEvent, QTextLayout, QPixmap, QIcon
 )
 from PySide6.QtCore import (
     QObject, QCoreApplication,
     Qt, QRect, QPointF, QTimer, QEvent
 )
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QPlainTextEdit, QWidget
+    QApplication, QMainWindow, QPlainTextEdit, QWidget,
+    QStatusBar, QLabel
 )
 
 
@@ -341,6 +342,84 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         self.set_overlay_position(row, col)
 
 
+class HeartbeatWidget(QLabel):
+    """A widget which shows the connection status to the server.
+
+    The connection status is determined by sending a ping request
+    every few seconds. If the ping takes too long to respond, the
+    heartbeat widget shows an icon indicating that the server may be
+    stuck.
+    """
+
+    _q: ServerMessageQueue
+
+    # How many periods have we gone without a pong?
+    _missed_beats: int
+    _got_last_beat: bool
+
+    _icon_normal: QIcon
+    _icon_beating: QIcon
+    _icon_disabled: QIcon
+
+    def __init__(
+            self, q: ServerMessageQueue,
+            parent: QWidget | None = None
+    ) -> None:
+        """Initialize the HeartbeatWidget."""
+        super().__init__(parent)
+
+        self._q = q
+
+        self._missed_beats = 0
+        self._got_last_beat = True
+
+        # Load icons
+        self._icon_normal = QIcon()
+        self._icon_beating = QIcon()
+        self._icon_disabled = QIcon()
+
+        self._icon_normal.addFile("./icons/heart_normal.png")
+        self._icon_beating.addFile("./icons/heart_beating.png")
+        self._icon_disabled.addFile("./icons/heart_disabled.png")
+
+        self.setPixmap(self._icon_normal.pixmap(16, 16))
+
+        # Setup timer
+        heartbeat_timer = QTimer(self, interval=5000)
+        heartbeat_timer.timeout.connect(self._on_heartbeat)
+        heartbeat_timer.start()
+
+    def _on_heartbeat(self) -> None:
+        if not self._got_last_beat:
+            self._missed_beats += 1
+            self.setPixmap(self._icon_disabled.pixmap(16, 16))
+
+        self._q.send(self, PingRequest())
+        self._got_last_beat = False
+
+    def event(self, e: QEvent) -> bool:
+        """Handle custom events."""
+        if isinstance(e, RequestResponseEvent):
+            if isinstance(e.req, PingRequest):
+                # We got a pong response. Set the icon to beating and
+                # reset `self._missed_beats`.
+                self._missed_beats = 0
+                self._got_last_beat = True
+
+                self.setPixmap(self._icon_beating.pixmap(16, 16))
+
+                # Switch the icon back to normal after a short
+                # duration.
+                anim_timer = QTimer(self, interval=200, singleShot=True)
+                anim_timer.timeout.connect(
+                    lambda: self.setPixmap(self._icon_normal.pixmap(16, 16))
+                )
+                anim_timer.start()
+
+        # Forward all other events to our superclass.
+        return super().event(e)
+
+
 class MainWindow(QMainWindow):
     """The main window of the application."""
 
@@ -353,11 +432,14 @@ class MainWindow(QMainWindow):
         self._q = q
         self._configure_editor()
         self._editor.set_overlay_position(1, 10)
+
         self.setCentralWidget(self._editor)
 
-        heartbeat_timer = QTimer(self, interval=5000)
-        heartbeat_timer.timeout.connect(self._on_heartbeat)
-        heartbeat_timer.start()
+        status_bar = QStatusBar()
+        self.setStatusBar(status_bar)
+
+        heartbeat = HeartbeatWidget(q)
+        status_bar.addPermanentWidget(heartbeat)
 
     def _configure_editor(self) -> None:
         self._editor = PlainTextEditWithOverlay()
@@ -365,18 +447,6 @@ class MainWindow(QMainWindow):
         self._editor.setFont(font)
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self._editor.document().setDocumentMargin(0)
-
-    def _on_heartbeat(self) -> None:
-        self._q.send(self, PingRequest())
-
-    def event(self, e: QEvent) -> bool:
-        """Handle custom events."""
-        if isinstance(e, RequestResponseEvent):
-            if isinstance(e.req, PingRequest):
-                # We got a pong response.
-                print(e.res.is_error())
-
-        return super().event(e)
 
 
 def main() -> None:
@@ -388,6 +458,7 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     main = MainWindow(q)
+    main.resize(720, 480)
     main.show()
 
     # Setup Langauge Server
