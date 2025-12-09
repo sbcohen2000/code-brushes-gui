@@ -4,11 +4,11 @@ from typing import Tuple
 from math import floor
 import sys
 from PySide6.QtGui import (
-    QFontDatabase, QFontMetricsF, QResizeEvent,
-    QMouseEvent
+   QFontDatabase, QResizeEvent,
+   QMouseEvent, QTextLayout
 )
 from PySide6.QtCore import (
-    Qt, QRect, QPoint, QPointF
+    Qt, QRect, QPointF
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QPlainTextEdit, QWidget
@@ -63,11 +63,21 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
 
     def _find_character_dimensions(self) -> Tuple[float, float]:
         """Find the size of a character in the editor."""
+        # We construct a new text layout using the same font as the
+        # editor (containing a single character), then measure the
+        # line height and width.
         font = self.font()
-        font_metrics = QFontMetricsF(font)
-        width = font_metrics.averageCharWidth()
-        height = font_metrics.height()
-        return width, height
+
+        layout = QTextLayout("x", font)
+        layout.beginLayout()
+        line = layout.createLine()
+        layout.endLayout()
+
+        line.setPosition(QPointF(0, 0))
+        line_height = line.height()
+        width = line.naturalTextWidth()
+
+        return width, line_height
 
     def rect_for_editor_position(self, row: int, col: int) -> QRect:
         """Find the (hypothetical) position of the character at (row, col)."""
@@ -91,8 +101,14 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         tuple of (row, col) describing the location of the character
         under the point.
         """
+        vert_scroll_amt = self.verticalScrollBar().value()
+        horz_scroll_amt = self.horizontalScrollBar().value()
+
         char_width, char_height = self._find_character_dimensions()
-        return (floor(point.y() / char_height), floor(point.x() / char_width))
+        return (
+            floor(point.y() / char_height) + vert_scroll_amt,
+            floor((point.x() + horz_scroll_amt) / char_width)
+        )
 
     def _update_cursor_overlay_geometry(self) -> None:
         if self._cursor_overlay_position is None:
