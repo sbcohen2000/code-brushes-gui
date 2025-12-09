@@ -1,7 +1,7 @@
 """Shaper GUI entrypoint."""
 
 from math import floor
-from typing import Tuple
+from typing import Tuple, Any
 from shutil import which
 import json
 import subprocess
@@ -20,16 +20,19 @@ from PySide6.QtWidgets import (
 )
 
 
+type JSON = dict[str, Any]
+
+
 class ServerMessageQueue():
     """Stores pending responses from the language server."""
 
-    _out_q: queue.Queue
+    _out_q: queue.Queue[Tuple[JSON, JSON]]
     _lk: threading.Lock
     _next_request_id: int
-    _pending_requests: dict[int, dict]
-    _proc: subprocess.Popen | None
+    _pending_requests: dict[int, JSON]
+    _proc: subprocess.Popen[str] | None
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Create a new message queue using a process handle to the server."""
         self._out_q = queue.Queue()
         self._lk = threading.Lock()
@@ -37,7 +40,7 @@ class ServerMessageQueue():
         self._pending_requests = {}
         self._proc = None
 
-    def send(self, req: dict):
+    def send(self, req: JSON) -> None:
         """Send a request to the server process."""
         id: int
         with self._lk:
@@ -48,7 +51,7 @@ class ServerMessageQueue():
         reqText = json.dumps(req)
 
         with self._lk:
-            if not self._proc:
+            if self._proc is None or self._proc.stdin is None:
                 print("Tried to send message to ServerMessageQueue \
                   without attached process")
                 return
@@ -57,12 +60,12 @@ class ServerMessageQueue():
             self._proc.stdin.write(reqText + "\n")
             self._proc.stdin.flush()
 
-    def attach_process(self, proc: subprocess.Popen):
+    def attach_process(self, proc: subprocess.Popen[str]) -> None:
         """Register a new langauge server process with the queue."""
         with self._lk:
             self._proc = proc
 
-    def enqueue(self, res: dict):
+    def enqueue(self, res: JSON) -> None:
         """Enqueue a response received from the server process."""
         with self._lk:
             req = self._pending_requests.pop(res["id"], None)
@@ -218,11 +221,11 @@ class MainWindow(QMainWindow):
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self._editor.document().setDocumentMargin(0)
 
-    def _on_heartbeat(self):
+    def _on_heartbeat(self) -> None:
         self._q.send({"jsonrpc": "2.0", "method": "ping"})
 
 
-def main():
+def main() -> None:
     """Start the application."""
     #
     # Setup Langauge Server
@@ -230,9 +233,13 @@ def main():
 
     q = ServerMessageQueue()
 
-    def reader_thread_main(proc: subprocess.Popen) -> None:
+    def reader_thread_main(proc: subprocess.Popen[str]) -> None:
         """Read responses from the language server and enqueue them."""
         while True:
+            if not proc.stdout:
+                print("Lost connection to server. Stopping.")
+                break
+
             line = proc.stdout.readline()
 
             # This case only occurs when the server has shut down
@@ -245,6 +252,10 @@ def main():
             q.enqueue(res)
 
     exe_path = which("code-brushes-server")
+    if not exe_path:
+        print("Cannot locate code-brushes-server")
+        exit(1)
+
     proc = subprocess.Popen(
         [exe_path],
         text=True,
