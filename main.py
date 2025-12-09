@@ -1,19 +1,20 @@
 """Shaper GUI entrypoint."""
 
+from abc import ABCMeta, abstractmethod
 from math import floor
-from typing import Tuple, Any
+from typing import Tuple, TypeVar, Any
 from shutil import which
 import json
 import subprocess
 import sys
 import threading
-import queue
 from PySide6.QtGui import (
    QFontDatabase, QResizeEvent,
    QMouseEvent, QTextLayout
 )
 from PySide6.QtCore import (
-    Qt, QRect, QPointF, QTimer
+    QObject, QCoreApplication,
+    Qt, QRect, QPointF, QTimer, QEvent
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QPlainTextEdit, QWidget
@@ -23,32 +24,171 @@ from PySide6.QtWidgets import (
 type JSON = dict[str, Any]
 
 
+class Request(metaclass=ABCMeta):
+    """A JSON-RPC request.
+
+    It is able to be encoded into a JSON blob. This class is meant to
+    be subclassed so that `method_name` and `method_params` might be
+    implemented.
+    """
+
+    def encode(self, id: int) -> str:
+        """Encode the request as a JSON string.
+
+        Takes the ID to associate with the request.
+        """
+        method = self.method_name()
+        params = self.method_params()
+
+        obj: JSON = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "id": str(id)
+        }
+
+        if params is not None:
+            obj["params"] = params
+
+        return json.dumps(obj)
+
+    @abstractmethod
+    def method_name(self) -> str:
+        """Get the method name of the request."""
+        raise NotImplementedError()
+
+    def method_params(self) -> JSON | None:
+        """Get the method params as a JSON object.
+
+        By default, it returns None, representing a request which has
+        no parameters.
+        """
+        return None
+
+    T = TypeVar('T', bound='Request')
+
+    @classmethod
+    def from_named_tuple(
+            cls: type[T],
+            methodname: str,
+            field_names: list[type[Any]]
+    ) -> type[Any]:
+        """Construct a new Request from a named tuple."""
+
+        def __init__(self: Any, **kwargs: dict[str, Any]) -> None:
+            self.keys = kwargs.keys()
+            for key, value in kwargs.items():
+                self.key = value
+
+        def method_params(self: Any) -> JSON | None:
+            if len(self.keys) == 0:
+                return None
+
+            obj: JSON = {}
+            for key in self.keys:
+                value = self.__dict__[key]
+                obj[key] = value
+
+            return obj
+
+        attrs: dict[str, Any] = {
+            'method_params': method_params,
+            'method_name': lambda self: methodname,
+            '__init__': __init__
+        }
+
+        ty = type(methodname, (Request,), attrs)
+        return ty
+
+
+class Response():
+    """A JSON-RPC response.
+
+    It is able to be decoded into a dictionary.
+    """
+
+    _id: int
+    _data: JSON
+
+    def __init__(self, data: JSON):
+        """Construct a Response object from a decoded JSON dictionary."""
+        self._data = data
+        self._id = int(self._data["id"])
+
+    T = TypeVar('T', bound='Response')
+
+    @classmethod
+    def from_json(cls: type[T], blob: str) -> T:
+        """Construct a Response object from a JSON string."""
+        data = json.loads(blob)
+        return cls(data)
+
+    def is_error(self) -> bool:
+        """Check if this response represents an error."""
+        return "error" in self._data
+
+    def error(self) -> JSON | None:
+        """Get the error component of the response.
+
+        Returns None if the response is not an error.
+        """
+        return self._data.get("error", None)
+
+    def result(self) -> JSON | None:
+        """Get the result component of the response.
+
+        Returns None if the response is an error.
+        """
+        return self._data.get("result", None)
+
+    def id(self) -> int:
+        """Get the id of the response."""
+        return self._id
+
+
+class RequestResponseEvent(QEvent):
+    """An event representing the server's response to a client request."""
+
+    req: Request
+    res: Response
+
+    def __init__(self, req: Request, res: Response):
+        """Construct a new RequestResponseEvent."""
+        super().__init__(QEvent.Type(QEvent.Type.User + 1))
+        self.req = req
+        self.res = res
+
+
+PingRequest = Request.from_named_tuple("ping", [])
+ShutdownRequest = Request.from_named_tuple("shutdown", [])
+
+
 class ServerMessageQueue():
     """Stores pending responses from the language server."""
 
-    _out_q: queue.Queue[Tuple[JSON, JSON]]
     _lk: threading.Lock
     _next_request_id: int
-    _pending_requests: dict[int, JSON]
+    _pending_requests: dict[int, tuple[QObject, Request]]
     _proc: subprocess.Popen[str] | None
 
     def __init__(self) -> None:
         """Create a new message queue using a process handle to the server."""
-        self._out_q = queue.Queue()
         self._lk = threading.Lock()
         self._next_request_id = 0
         self._pending_requests = {}
         self._proc = None
 
-    def send(self, req: JSON) -> None:
-        """Send a request to the server process."""
+    def send(self, sender: QObject, req: Request) -> None:
+        """Send a request to the server process.
+
+        We record the sender of the request so that when the response
+        is recieved, it can be routed to the sender.
+        """
         id: int
         with self._lk:
             id = self._next_request_id
             self._next_request_id += 1
 
-        req["id"] = id
-        reqText = json.dumps(req)
+        reqText = req.encode(id)
 
         with self._lk:
             if self._proc is None or self._proc.stdin is None:
@@ -56,7 +196,7 @@ class ServerMessageQueue():
                   without attached process")
                 return
 
-            self._pending_requests[id] = req
+            self._pending_requests[id] = (sender, req)
             self._proc.stdin.write(reqText + "\n")
             self._proc.stdin.flush()
 
@@ -65,15 +205,20 @@ class ServerMessageQueue():
         with self._lk:
             self._proc = proc
 
-    def enqueue(self, res: JSON) -> None:
-        """Enqueue a response received from the server process."""
-        with self._lk:
-            req = self._pending_requests.pop(res["id"], None)
+    def pop_request(self, res: Response) -> tuple[QObject, Request] | None:
+        """Find the request for a given response.
 
-            if req is None:
-                print("Got unmatched response. Dropping.")
-            else:
-                self._out_q.put((req, res))
+        Find the request with the same ID as the given response,
+        removing it from the pool of pending responses. The function
+        returns both the original sender of the request along with the
+        request itself. If no pending request with the given ID can
+        be found, return None.
+        """
+        req: tuple[QObject, Request] | None
+        with self._lk:
+            req = self._pending_requests.pop(res.id(), None)
+
+        return req
 
 
 class PlainTextEditWithOverlay(QPlainTextEdit):
@@ -222,16 +367,30 @@ class MainWindow(QMainWindow):
         self._editor.document().setDocumentMargin(0)
 
     def _on_heartbeat(self) -> None:
-        self._q.send({"jsonrpc": "2.0", "method": "ping"})
+        self._q.send(self, PingRequest())
+
+    def event(self, e: QEvent) -> bool:
+        """Handle custom events."""
+        if isinstance(e, RequestResponseEvent):
+            if isinstance(e.req, PingRequest):
+                # We got a pong response.
+                print(e.res.is_error())
+
+        return super().event(e)
 
 
 def main() -> None:
     """Start the application."""
-    #
-    # Setup Langauge Server
-    #
-
     q = ServerMessageQueue()
+
+    # Setup QTApp, providing the main window with the server message
+    # queue so that it can make requests.
+
+    app = QApplication(sys.argv)
+    main = MainWindow(q)
+    main.show()
+
+    # Setup Langauge Server
 
     def reader_thread_main(proc: subprocess.Popen[str]) -> None:
         """Read responses from the language server and enqueue them."""
@@ -248,8 +407,16 @@ def main() -> None:
             if not line:
                 break
 
-            res = json.loads(line)
-            q.enqueue(res)
+            res = Response.from_json(line)
+            req_info = q.pop_request(res)
+
+            if not req_info:
+                print(f"Could not find matching request for response: {res}")
+            else:
+                # Dispatch the event to the main window.
+                sender, req = req_info
+                ev = RequestResponseEvent(req, res)
+                QCoreApplication.postEvent(sender, ev)
 
     exe_path = which("code-brushes-server")
     if not exe_path:
@@ -271,17 +438,9 @@ def main() -> None:
 
     q.attach_process(proc)
 
-    #
-    # Setup QTApp
-    #
-
-    app = QApplication(sys.argv)
-    main = MainWindow(q)
-    main.show()
     app.exec()
-
     # Signal that we want to stop the reader thread.
-    q.send({"jsonrpc": "2.0", "method": "shutdown"})
+    q.send(app, ShutdownRequest())
     t.join()
 
 
