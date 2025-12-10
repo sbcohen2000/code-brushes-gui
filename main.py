@@ -2,8 +2,9 @@
 
 from abc import ABCMeta, abstractmethod
 from math import floor
-from typing import Tuple, TypeVar, Any
 from shutil import which
+from typing import Tuple, TypeVar, Any
+import argparse
 import json
 import subprocess
 import sys
@@ -510,6 +511,19 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     """Start the application."""
+    # Handle command-line arguments
+
+    parser = argparse.ArgumentParser(
+        prog='Code brushes GUI',
+        description='Edit programs using the Code Brushes Language Server')
+
+    parser.add_argument('--server-bin',
+                        help="Specify an alternate language server program.",
+                        metavar="PATH")
+    args = parser.parse_args()
+
+    # Setup the message queue.
+
     q = ServerMessageQueue()
 
     # Setup QTApp, providing the main window with the server message
@@ -548,10 +562,19 @@ def main() -> None:
                 ev = RequestResponseEvent(req, res)
                 QCoreApplication.postEvent(sender, ev)
 
-    exe_path = which("code-brushes-server")
-    if not exe_path:
-        print("Cannot locate code-brushes-server")
-        exit(1)
+    # Startup the langauge server by opening a subprocess. If the user
+    # provided an alternate language server binary, use
+    # that. Otherwise, look for a program called `code-brushes-server`
+    # on the path.
+    exe_path: str
+    if args.server_bin is None:
+        mexe_path = which("code-brushes-server")
+        if mexe_path is None:
+            print("Cannot locate code-brushes-server")
+            exit(1)
+        exe_path = mexe_path
+    else:
+        exe_path = args.server_bin
 
     proc = subprocess.Popen(
         [exe_path],
