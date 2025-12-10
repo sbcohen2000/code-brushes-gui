@@ -11,7 +11,8 @@ import sys
 import threading
 from PySide6.QtGui import (
    QFontDatabase, QResizeEvent,
-   QMouseEvent, QTextLayout, QIcon
+   QMouseEvent, QTextLayout, QIcon,
+   QTextCursor
 )
 from PySide6.QtCore import (
     QObject, QCoreApplication,
@@ -330,6 +331,29 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         col = cursor.positionInBlock()
         return {"row": row, "col": col}
 
+    def set_cursor_position(self, pos: Pos) -> None:
+        """Set the position of the cursor.
+
+        If the position doesn't correspond to a valid document
+        location, this method will set the cursor to the closest valid
+        position.
+        """
+        print("setting pos to ", pos)
+        # Reset the cursor to the beginning of the document.
+        cursor = self.textCursor()
+        cursor.setPosition(0)
+
+        # Move the cursor down by the number of rows.
+        cursor.movePosition(QTextCursor.MoveOperation.Down, n=pos["row"])
+
+        # Find the number of columns on the desired line.
+        nCols = cursor.block().length()
+        nMoves = min(pos["col"], nCols - 1)
+
+        # Move the cursor right by the number of columns
+        cursor.movePosition(QTextCursor.MoveOperation.Right, n=nMoves)
+        self.setTextCursor(cursor)
+
     def _update_cursor_overlay_geometry(self) -> None:
         if self._cursor_overlay_position is None:
             return
@@ -509,7 +533,9 @@ class MainWindow(QMainWindow):
             # infinite loop).
             with QSignalBlocker(self._editor.document()), \
                  QSignalBlocker(self._editor):
+                pos = self._editor.cursor_position()
                 self._editor.setPlainText(new_src)
+                self._editor.set_cursor_position(pos)
 
         # Forward all other events to our superclass.
         return super().event(e)
