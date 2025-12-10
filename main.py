@@ -15,7 +15,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtCore import (
     QObject, QCoreApplication,
-    Qt, QRect, QPointF, QTimer, QEvent
+    Qt, QRect, QPointF, QTimer, QEvent, QSignalBlocker
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QPlainTextEdit, QWidget,
@@ -502,14 +502,13 @@ class MainWindow(QMainWindow):
                 print(f"Error: {e.res.error()}")
                 return True
 
-            old_src = self._get_editor_contents()
             new_src = result["src"]
 
-            # Check if the source has changed before dispatching a
-            # call to set the document content. If we don't do this,
-            # we can enter into an infinite loop where the below
-            # change triggers another `contentsChanged` signal.
-            if new_src != old_src:
+            # Don't trigger contentsChanged or cursorPositionChanged
+            # events when we apply the formatting. (This will cause an
+            # infinite loop).
+            with QSignalBlocker(self._editor.document()), \
+                 QSignalBlocker(self._editor):
                 self._editor.setPlainText(new_src)
 
         # Forward all other events to our superclass.
