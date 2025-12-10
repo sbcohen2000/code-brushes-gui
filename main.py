@@ -3,7 +3,7 @@
 from abc import ABCMeta, abstractmethod
 from math import floor
 from shutil import which
-from typing import Tuple, TypeVar, Any
+from typing import Tuple, TypeVar, Any, TypedDict
 import argparse
 import json
 import subprocess
@@ -166,7 +166,9 @@ class RequestResponseEvent(QEvent):
 
 PingRequest = Request.from_named_tuple("ping", {})
 ShutdownRequest = Request.from_named_tuple("shutdown", {})
-FormatRequest = Request.from_named_tuple("format", {"src": str})
+
+Pos = TypedDict("Pos", {"row": int, "col": int})
+FormatRequest = Request.from_named_tuple("format", {"src": str, "pos": Pos})
 
 
 class ServerMessageQueue():
@@ -237,7 +239,7 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
     """
 
     _editor: QPlainTextEdit
-    _cursor_overlay_position: Tuple[int, int] | None = None
+    _cursor_overlay_position: Pos | None = None
     _cursor_overlay_widget: QWidget
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -292,7 +294,7 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
 
         return width, line_height
 
-    def rect_for_editor_position(self, row: int, col: int) -> QRect:
+    def rect_for_editor_position(self, pos: Pos) -> QRect:
         """Find the (hypothetical) position of the character at (row, col)."""
         # The vertical and horizontal scroll amounts are in
         # lines/pixels respectively.
@@ -301,13 +303,13 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         char_width, char_height = self._find_character_dimensions()
 
         return QRect(
-            round(col * char_width - horz_scroll_amt),
-            round(row * char_height - vert_scroll_amt * char_height),
+            round(pos["col"] * char_width - horz_scroll_amt),
+            round(pos["row"] * char_height - vert_scroll_amt * char_height),
             round(char_width),
             round(char_height)
         )
 
-    def editor_position_under_point(self, point: QPointF) -> Tuple[int, int]:
+    def editor_position_under_point(self, point: QPointF) -> Pos:
         """Find the row and column of a point.
 
         Given a point in the editor's local coordinate space, return a
@@ -318,21 +320,26 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         horz_scroll_amt = self.horizontalScrollBar().value()
 
         char_width, char_height = self._find_character_dimensions()
-        return (
-            floor(point.y() / char_height) + vert_scroll_amt,
-            floor((point.x() + horz_scroll_amt) / char_width)
-        )
+        return {"row": floor(point.y() / char_height) + vert_scroll_amt,
+                "col": floor((point.x() + horz_scroll_amt) / char_width)}
+
+    def cursor_position(self) -> Pos:
+        """Find the current position of the cursor."""
+        cursor = self.textCursor()
+        row = cursor.blockNumber()
+        col = cursor.positionInBlock()
+        return {"row": row, "col": col}
 
     def _update_cursor_overlay_geometry(self) -> None:
         if self._cursor_overlay_position is None:
             return
 
-        r = self.rect_for_editor_position(*self._cursor_overlay_position)
+        r = self.rect_for_editor_position(self._cursor_overlay_position)
         self._cursor_overlay_widget.setGeometry(r)
 
-    def set_overlay_position(self, row: int, col: int) -> None:
+    def set_overlay_position(self, pos: Pos) -> None:
         """Set the position of the overlay."""
-        self._cursor_overlay_position = (row, col)
+        self._cursor_overlay_position = pos
         self._update_cursor_overlay_geometry()
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
@@ -343,9 +350,9 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         """
         super().mouseMoveEvent(e)
 
-        pos = e.position()
-        row, col = self.editor_position_under_point(pos)
-        self.set_overlay_position(row, col)
+        point = e.position()
+        pos = self.editor_position_under_point(point)
+        self.set_overlay_position(pos)
 
 
 class HeartbeatWidget(QLabel):
@@ -442,7 +449,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._q = q
         self._configure_editor()
-        self._editor.set_overlay_position(1, 10)
 
         self.setCentralWidget(self._editor)
 
@@ -482,7 +488,8 @@ class MainWindow(QMainWindow):
     def _request_formatting_actions(self) -> None:
         """Request that the document be re-formatted."""
         src = self._get_editor_contents()
-        self._q.send(self, FormatRequest(src=src))
+        pos = self._editor.cursor_position()
+        self._q.send(self, FormatRequest(src=src, pos=pos))
 
     def event(self, e: QEvent) -> bool:
         """Handle custom events."""
