@@ -3,7 +3,11 @@
 from abc import ABCMeta, abstractmethod
 from math import floor
 from shutil import which
-from typing import Tuple, TypeVar, Any, TypedDict
+from typing import (
+    Tuple, TypeVar, Any, TypedDict,
+    get_type_hints, cast
+)
+from dataclasses import dataclass, asdict
 import argparse
 import json
 import subprocess
@@ -27,149 +31,141 @@ from PySide6.QtWidgets import (
 type JSON = dict[str, Any]
 
 
-class Request(metaclass=ABCMeta):
-    """A JSON-RPC request.
+A = TypeVar('A')
 
-    It is able to be encoded into a JSON blob. This class is meant to
-    be subclassed so that `method_name` and `method_params` might be
-    implemented.
+
+def validate_typed_dict(value: object, typ: A) -> None:
     """
+    Check that the given value confirms to the given type.
 
-    def encode(self, id: int) -> str:
-        """Encode the request as a JSON string.
+    This function is due to https://stackoverflow.com/a/76242123.
+    """
+    if not isinstance(value, dict):
+        raise TypeError(f'Value must be a dict not a {type(value).__name__}')
+    d = get_type_hints(typ)
+    diff = d.keys() ^ value.keys()
+    if diff:
+        raise TypeError(f"Invalid dict fields: {' '.join(diff)}")
+    for k, v in get_type_hints(typ).items():
+        if not isinstance(value[k], v):
+            raise TypeError(
+                f"Invalid type: '{k}' should be {v.__name__} "
+                f"but is {type(value[k]).__name__}"
+            )
 
-        Takes the ID to associate with the request.
-        """
-        method = self.method_name()
-        params = self.method_params()
 
-        obj: JSON = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "id": str(id)
-        }
+@dataclass
+class Request(metaclass=ABCMeta):
+    """An object which can be encoded into a JSON-RPC request."""
 
-        if params is not None:
-            obj["params"] = params
-
-        return json.dumps(obj)
-
+    @property
     @abstractmethod
     def method_name(self) -> str:
-        """Get the method name of the request."""
+        """Get the name of the method."""
         raise NotImplementedError()
 
-    def method_params(self) -> JSON | None:
-        """Get the method params as a JSON object.
 
-        By default, it returns None, representing a request which has
-        no parameters.
-        """
-        return None
+def encode(req: Request, id: int) -> str:
+    """Encode a request as a JSON string."""
+    method = req.method_name
 
-    T = TypeVar('T', bound='Request')
+    obj: JSON = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "id": str(id)
+    }
 
-    @classmethod
-    def from_named_tuple(
-            cls: type[T],
-            methodname: str,
-            field_names: dict[str, type[Any]]
-    ) -> type[Any]:
-        """Construct a new Request from a named tuple."""
+    params = asdict(req)
+    if len(params.keys()) > 0:
+        obj["params"] = params
 
-        def __init__(self: Any, **kwargs: dict[str, Any]) -> None:
-            self.keys = kwargs.keys()
-
-            for key, typ in field_names.items():
-                if key not in kwargs:
-                    raise ValueError(f"Key {key} is missing from constructor.")
-
-                self.__dict__[key] = kwargs[key]
-
-        def method_params(self: Any) -> JSON | None:
-            if len(self.keys) == 0:
-                return None
-
-            obj: JSON = {}
-            for key in self.keys:
-                value = self.__dict__[key]
-                obj[key] = value
-
-            return obj
-
-        attrs: dict[str, Any] = {
-            'method_params': method_params,
-            'method_name': lambda self: methodname,
-            '__init__': __init__
-        }
-
-        ty = type(methodname, (Request,), attrs)
-        return ty
+    return json.dumps(obj)
 
 
-class Response():
-    """A JSON-RPC response.
+class Response(TypedDict):
+    """An object which can be decoded from a JSON-RPC response."""
 
-    It is able to be decoded into a dictionary.
-    """
+    pass
 
-    _id: int
-    _data: JSON
 
-    def __init__(self, data: JSON):
-        """Construct a Response object from a decoded JSON dictionary."""
-        self._data = data
-        self._id = int(self._data["id"])
+@dataclass
+class ErrorResponse:
+    """An error response."""
 
-    T = TypeVar('T', bound='Response')
+    code: int
+    message: str
+    data: JSON | None
 
-    @classmethod
-    def from_json(cls: type[T], blob: str) -> T:
-        """Construct a Response object from a JSON string."""
-        data = json.loads(blob)
-        return cls(data)
 
-    def is_error(self) -> bool:
-        """Check if this response represents an error."""
-        return "error" in self._data
-
-    def error(self) -> JSON | None:
-        """Get the error component of the response.
-
-        Returns None if the response is not an error.
-        """
-        return self._data.get("error", None)
-
-    def result(self) -> JSON | None:
-        """Get the result component of the response.
-
-        Returns None if the response is an error.
-        """
-        return self._data.get("result", None)
-
-    def id(self) -> int:
-        """Get the id of the response."""
-        return self._id
+def decode(obj: JSON, typ: type[A]) -> A | ErrorResponse:
+    """Decode a message into a JSON-RPC response."""
+    if "result" in obj:
+        validate_typed_dict(obj["result"], typ)
+        return cast(A, obj["result"])
+    else:
+        assert "error" in obj
+        error = obj["error"]
+        return ErrorResponse(code=int(error["code"]),
+                             message=error["message"],
+                             data=error["data"])
 
 
 class RequestResponseEvent(QEvent):
     """An event representing the server's response to a client request."""
 
     req: Request
-    res: Response
+    res: JSON
 
-    def __init__(self, req: Request, res: Response):
+    def __init__(self, req: Request, res: JSON):
         """Construct a new RequestResponseEvent."""
         super().__init__(QEvent.Type(QEvent.Type.User + 1))
         self.req = req
         self.res = res
 
 
-PingRequest = Request.from_named_tuple("ping", {})
-ShutdownRequest = Request.from_named_tuple("shutdown", {})
+class PingRequest(Request):
+    """Ping the server to check if it's alive."""
+
+    @property
+    def method_name(self) -> str:
+        """Return the method name."""
+        return "ping"
+
+
+class PingResponse(Response):
+    """See PingRequest."""
+
+    pass
+
+
+class ShutdownRequest(Request):
+    """Request that the server shut down."""
+
+    @property
+    def method_name(self) -> str:
+        """Return the method name."""
+        return "shutdown"
+
 
 Pos = TypedDict("Pos", {"row": int, "col": int})
-FormatRequest = Request.from_named_tuple("format", {"src": str, "pos": Pos})
+
+
+@dataclass
+class FormatRequest(Request):
+    """Request that the server format the source code."""
+
+    src: str
+
+    @property
+    def method_name(self) -> str:
+        """Return the method name."""
+        return "format"
+
+
+class FormatResponse(Response):
+    """See FormatRequest."""
+
+    src: str
 
 
 class ServerMessageQueue():
@@ -198,7 +194,7 @@ class ServerMessageQueue():
             id = self._next_request_id
             self._next_request_id += 1
 
-        reqText = req.encode(id)
+        reqText = encode(req, id)
 
         with self._lk:
             if self._proc is None or self._proc.stdin is None:
@@ -215,7 +211,7 @@ class ServerMessageQueue():
         with self._lk:
             self._proc = proc
 
-    def pop_request(self, res: Response) -> tuple[QObject, Request] | None:
+    def pop_request(self, res: JSON) -> tuple[QObject, Request] | None:
         """Find the request for a given response.
 
         Find the request with the same ID as the given response,
@@ -226,7 +222,7 @@ class ServerMessageQueue():
         """
         req: tuple[QObject, Request] | None
         with self._lk:
-            req = self._pending_requests.pop(res.id(), None)
+            req = self._pending_requests.pop(int(res["id"]), None)
 
         return req
 
@@ -338,7 +334,6 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         location, this method will set the cursor to the closest valid
         position.
         """
-        print("setting pos to ", pos)
         # Reset the cursor to the beginning of the document.
         cursor = self.textCursor()
         cursor.setPosition(0)
@@ -512,18 +507,17 @@ class MainWindow(QMainWindow):
     def _request_formatting_actions(self) -> None:
         """Request that the document be re-formatted."""
         src = self._get_editor_contents()
-        pos = self._editor.cursor_position()
-        self._q.send(self, FormatRequest(src=src, pos=pos))
+        self._q.send(self, FormatRequest(src=src))
 
     def event(self, e: QEvent) -> bool:
         """Handle custom events."""
         if isinstance(e, RequestResponseEvent) \
            and isinstance(e.req, FormatRequest):
-            result = e.res.result()
+            result = decode(e.res, FormatResponse)
 
-            if result is None:
+            if isinstance(result, ErrorResponse):
                 # TODO: handle the error properly
-                print(f"Error: {e.res.error()}")
+                print(f"Error: {result.message}")
                 return True
 
             new_src = result["src"]
@@ -583,7 +577,7 @@ def main() -> None:
             if not line:
                 break
 
-            res = Response.from_json(line)
+            res = json.loads(line)
             req_info = q.pop_request(res)
 
             if not req_info:
