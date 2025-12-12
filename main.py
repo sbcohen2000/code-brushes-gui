@@ -16,7 +16,8 @@ import threading
 from PySide6.QtGui import (
    QFontDatabase, QResizeEvent,
    QMouseEvent, QTextLayout, QIcon,
-   QTextCursor
+   QTextCursor, QSyntaxHighlighter,
+   QTextCharFormat, QTextDocument
 )
 from PySide6.QtCore import (
     QObject, QCoreApplication,
@@ -148,6 +149,7 @@ class ShutdownRequest(Request):
 
 
 Pos = TypedDict("Pos", {"row": int, "col": int})
+SrcRange = TypedDict("SrcRange", {"begin": Pos, "end": Pos})
 
 
 @dataclass
@@ -227,6 +229,57 @@ class ServerMessageQueue():
         return req
 
 
+class ErrorHighlighter(QSyntaxHighlighter):
+    """A Syntax Highlighter which can highlight source ranges."""
+
+    _rng: SrcRange | None
+    _format: QTextCharFormat
+
+    def __init__(self, parent: QTextDocument, format: QTextCharFormat):
+        """Initialize the ErrorHighlighter with the desired char format."""
+        super().__init__(parent)
+        self._rng = None
+        self._format = format
+
+    def set_src_range(self, rng: SrcRange) -> None:
+        """Set the source range of the highlighted error."""
+        self._rng = rng
+        self.rehighlight()
+
+    def unset_src_range(self) -> None:
+        """Unset the error source range.
+
+        After this method has been called, until set_src_range is
+        called, the highlighter will not apply any style to the
+        document.
+        """
+        self._rng = None
+        self.rehighlight()
+
+    def highlightBlock(self, _text: str) -> None:
+        """Highlight a single block in the document."""
+        # If we don't have a source range, there's nothing to
+        # highlight.
+        if not self._rng:
+            return
+
+        block = self.currentBlock()
+        row_no = block.blockNumber()
+        n_cols = block.length()
+
+        begin_row = self._rng["begin"]["row"]
+        begin_col = self._rng["begin"]["col"]
+        end_row = self._rng["end"]["row"]
+        end_col = self._rng["end"]["col"]
+
+        if row_no == begin_row:
+            self.setFormat(begin_col, n_cols - begin_col, self._format)
+        elif row_no == end_row:
+            self.setFormat(0, end_col + 1, self._format)
+        elif begin_row < row_no and row_no < end_row:
+            self.setFormat(0, n_cols, self._format)
+
+
 class PlainTextEditWithOverlay(QPlainTextEdit):
     """A QPlainTextEdit with a cursor overlay.
 
@@ -235,7 +288,6 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
     character position.
     """
 
-    _editor: QPlainTextEdit
     _cursor_overlay_position: Pos | None = None
     _cursor_overlay_widget: QWidget
 
@@ -334,20 +386,66 @@ class PlainTextEditWithOverlay(QPlainTextEdit):
         location, this method will set the cursor to the closest valid
         position.
         """
+        cursor = self.cursor_for_src_position(pos)
+        self.setTextCursor(cursor)
+
+    def cursor_for_src_position(self, pos: Pos) -> QTextCursor:
+        """Produce a QTextCursor at the given source position.
+
+        If the position doesn't correspond to a valid document
+        location, this method will set the cursor to the closest valid
+        position.
+
+        When `cursor` is provided, move it instead of creating a new
+        cursor.
+        """
         # Reset the cursor to the beginning of the document.
-        cursor = self.textCursor()
+        cursor = QTextCursor(self.document().findBlockByNumber(pos["row"]))
         cursor.setPosition(0)
 
         # Move the cursor down by the number of rows.
         cursor.movePosition(QTextCursor.MoveOperation.Down, n=pos["row"])
 
         # Find the number of columns on the desired line.
-        nCols = cursor.block().length()
-        nMoves = min(pos["col"], nCols - 1)
+        n_cols = cursor.block().length()
+        n_moves = min(pos["col"], n_cols - 1)
 
         # Move the cursor right by the number of columns
-        cursor.movePosition(QTextCursor.MoveOperation.Right, n=nMoves)
-        self.setTextCursor(cursor)
+        cursor.movePosition(QTextCursor.MoveOperation.Right, n=n_moves)
+        return cursor
+
+    def cursor_for_src_range(self, rng: SrcRange) -> QTextCursor:
+        """Produce a QTextCursor which selects the given source range."""
+        cursor = self.cursor_for_src_position(rng["begin"])
+
+        if rng["begin"]["row"] == rng["end"]["row"]:
+            # If the range has only a single row, we need only move
+            # the cursor right by the correct number of columns.
+
+            n_moves = rng["end"]["col"] - rng["begin"]["col"]
+            cursor.movePosition(QTextCursor.MoveOperation.Right,
+                                QTextCursor.MoveMode.KeepAnchor,
+                                n=n_moves)
+        else:
+            # Otherwise, we need to reset the cursor to the beginning
+            # of the line, then move down by the proper number of
+            # rows, then move the cursor right by the correct number
+            # of columns.
+
+            cursor.movePosition(QTextCursor.MoveOperation.StartOfLine,
+                                QTextCursor.MoveMode.KeepAnchor)
+
+            n_down_moves = rng["end"]["row"] - rng["begin"]["row"]
+            cursor.movePosition(QTextCursor.MoveOperation.Down,
+                                QTextCursor.MoveMode.KeepAnchor,
+                                n=n_down_moves)
+
+            n_right_moves = rng["end"]["col"]
+            cursor.movePosition(QTextCursor.MoveOperation.Right,
+                                QTextCursor.MoveMode.KeepAnchor,
+                                n=n_right_moves)
+
+        return cursor
 
     def _update_cursor_overlay_geometry(self) -> None:
         if self._cursor_overlay_position is None:
@@ -457,6 +555,7 @@ class MainWindow(QMainWindow):
     """The main window of the application."""
 
     _editor: PlainTextEditWithOverlay
+    _highlighter: ErrorHighlighter
     _q: ServerMessageQueue
 
     # A timer which, when it runs out, indicates that the user has not
@@ -492,6 +591,17 @@ class MainWindow(QMainWindow):
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self._editor.document().setDocumentMargin(0)
 
+        # Setup highlighter
+        error_format = QTextCharFormat()
+        error_format.setUnderlineStyle(
+            QTextCharFormat.UnderlineStyle.WaveUnderline
+        )
+        error_format.setUnderlineColor("red")
+        self._highlighter = ErrorHighlighter(
+            self._editor.document(),
+            error_format
+        )
+
         # Reset the change timer when the document content changes
         self._editor.document().contentsChanged \
             .connect(self._reset_change_timer)
@@ -509,27 +619,43 @@ class MainWindow(QMainWindow):
         src = self._get_editor_contents()
         self._q.send(self, FormatRequest(src=src))
 
+    def _handle_format_response(
+            self,
+            result: FormatResponse | ErrorResponse
+    ) -> bool:
+        if isinstance(result, ErrorResponse):
+            if result.code == -1:
+                # Then, we have a parse error, and can be sure that
+                # the error data is a source range.
+                rng = cast(SrcRange, result.data)
+
+                # Set error highlights
+                self._highlighter.set_src_range(rng)
+
+            return True
+
+        # Remove error highlights
+        self._highlighter.unset_src_range()
+
+        new_src = result["src"]
+
+        # Don't trigger contentsChanged or cursorPositionChanged
+        # events when we apply the formatting. (This will cause an
+        # infinite loop).
+        with QSignalBlocker(self._editor.document()), \
+             QSignalBlocker(self._editor):
+            pos = self._editor.cursor_position()
+            self._editor.setPlainText(new_src)
+            self._editor.set_cursor_position(pos)
+
+        return True
+
     def event(self, e: QEvent) -> bool:
         """Handle custom events."""
         if isinstance(e, RequestResponseEvent) \
            and isinstance(e.req, FormatRequest):
             result = decode(e.res, FormatResponse)
-
-            if isinstance(result, ErrorResponse):
-                # TODO: handle the error properly
-                print(f"Error: {result.message}")
-                return True
-
-            new_src = result["src"]
-
-            # Don't trigger contentsChanged or cursorPositionChanged
-            # events when we apply the formatting. (This will cause an
-            # infinite loop).
-            with QSignalBlocker(self._editor.document()), \
-                 QSignalBlocker(self._editor):
-                pos = self._editor.cursor_position()
-                self._editor.setPlainText(new_src)
-                self._editor.set_cursor_position(pos)
+            return self._handle_format_response(result)
 
         # Forward all other events to our superclass.
         return super().event(e)
